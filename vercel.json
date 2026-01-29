@@ -1,0 +1,20 @@
+{
+  "rewrites": [
+    {
+      "source": "/manifest.json",
+      "destination": "/api/index"
+    },
+    {
+      "source": "/:config/manifest.json",
+      "destination": "/api/index"
+    },
+    {
+      "source": "/stream/:type/:id",
+      "destination": "/api/index"
+    },
+    {
+      "source": "/:config/stream/:type/:id",
+      "destination": "/api/index"
+    }
+  ]
+}
