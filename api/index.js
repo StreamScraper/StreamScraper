@@ -2,6 +2,10 @@ import axios from 'axios';
 
 // --- Configuration ---
 const TRACKER_URL = "https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_all.txt";
+const APIBAY_URL = "https://apibay.org/q.php";
+
+// Common User-Agent to mimic a real browser
+const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
 // --- In-Memory Cache (Persists only if container is warm) ---
 let trackerCache = { data: [], lastUpdated: 0 };
@@ -11,10 +15,22 @@ async function getTrackers() {
     if (now - trackerCache.lastUpdated > 1000 * 60 * 15 || trackerCache.data.length === 0) {
         try {
             console.log("Refreshing trackers...");
-            const resp = await axios.get(TRACKER_URL);
+            const resp = await axios.get(TRACKER_URL, {
+                headers: { 'User-Agent': USER_AGENT }
+            });
             trackerCache.data = resp.data.split('\n').map(l => l.trim()).filter(l => l.length > 0);
             trackerCache.lastUpdated = now;
-        } catch (e) { console.error("Tracker update failed"); }
+        } catch (e) { 
+            console.error("Tracker update failed");
+            // Fallback trackers if fetch fails
+            if (trackerCache.data.length === 0) {
+                trackerCache.data = [
+                    "udp://tracker.opentrackr.org:1337/announce",
+                    "udp://9.rarbg.com:2810/announce",
+                    "udp://tracker.openbittorrent.com:80/announce"
+                ];
+            }
+        }
     }
     return trackerCache.data;
 }
@@ -22,20 +38,13 @@ async function getTrackers() {
 function parseConfig(configStr) {
     try {
         if (!configStr) return {};
-        // 1. Restore standard Base64 characters
         let base64 = configStr.replace(/-/g, '+').replace(/_/g, '/');
-        // 2. Add padding back if needed
         while (base64.length % 4) {
             base64 += '=';
         }
-        // 3. Decode
-        // Buffer.from(base64, 'base64') produces the raw bytes.
-        // .toString('utf-8') converts those bytes to a UTF-8 string.
-        // This exactly matches the frontend's TextEncoder/TextDecoder logic.
         const decoded = Buffer.from(base64, 'base64').toString('utf-8');
         return JSON.parse(decoded);
     } catch (e) {
-        // console.error("Config Parse Error", e);
         return {};
     }
 }
@@ -51,7 +60,7 @@ function getResolution(title) {
 function getManifest(host) {
     return {
         id: "org.community.cloud.scraper",
-        version: "1.2.0",
+        version: "1.2.1",
         name: "Cloud Stream Scraper",
         description: "Configurable Cloud Scraper with RD Support",
         catalogs: [],
@@ -65,8 +74,7 @@ function getManifest(host) {
         types: ["movie", "series"],
         behaviorHints: {
             configurable: true,
-            configurationRequired: false,
-            configurationLocation: `https://${host}/`
+            configurationRequired: false
         }
     };
 }
@@ -93,10 +101,12 @@ async function getStreams(type, id, config) {
     const maxResultsPerRes = parseInt(config.maxResultsPerRes) || 5;
 
     try {
-        const searchUrl = `https://apibay.org/q.php?q=${query}&cat=0`;
-        const { data } = await axios.get(searchUrl);
+        // Fetch from APIBAY with headers
+        const { data } = await axios.get(`${APIBAY_URL}?q=${query}&cat=0`, {
+            headers: { 'User-Agent': USER_AGENT }
+        });
 
-        if (!Array.isArray(data) || data[0]?.id === '0') {
+        if (!Array.isArray(data) || data.length === 0 || data[0]?.id === '0') {
             return [];
         }
 
@@ -155,7 +165,6 @@ async function getStreams(type, id, config) {
 
 // --- Vercel Handler ---
 export default async function handler(req, res) {
-    // Enable CORS for Stremio Web
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -166,18 +175,14 @@ export default async function handler(req, res) {
     }
 
     const { url } = req;
-    
-    // Parse Config from URL path if present
     const pathParts = url.split('/').filter(p => p.length > 0);
     
     let configStr = null;
     let isManifest = false;
     let isStream = false;
     
-    // Simple Router Logic
     if (url.includes('manifest.json')) {
         isManifest = true;
-        // Check if config exists before manifest.json
         const idx = pathParts.indexOf('manifest.json');
         if (idx > 0) configStr = pathParts[idx - 1];
     } else if (url.includes('/stream/')) {
@@ -186,27 +191,33 @@ export default async function handler(req, res) {
         if (streamIdx > 0) configStr = pathParts[streamIdx - 1];
     }
 
+    // Default config if missing or homepage
     const config = parseConfig(configStr);
 
-    if (isManifest) {
-        res.status(200).json(getManifest(req.headers.host));
-        return;
-    }
-
-    if (isStream) {
-        // Extract type and id
-        // pathParts looks like: [config?, 'stream', type, id.json]
-        const streamIdx = pathParts.indexOf('stream');
-        if (streamIdx > -1 && pathParts[streamIdx + 2]) {
-            const type = pathParts[streamIdx + 1];
-            const idWithExt = pathParts[streamIdx + 2];
-            const id = idWithExt.replace('.json', '');
-            
-            const streams = await getStreams(type, id, config);
-            res.status(200).json({ streams });
+    try {
+        if (isManifest) {
+            res.status(200).json(getManifest(req.headers.host));
             return;
         }
-    }
 
-    res.status(404).json({ error: "Not Found" });
+        if (isStream) {
+            const streamIdx = pathParts.indexOf('stream');
+            if (streamIdx > -1 && pathParts[streamIdx + 2]) {
+                const type = pathParts[streamIdx + 1];
+                const idWithExt = pathParts[streamIdx + 2];
+                const id = idWithExt.replace('.json', '');
+                
+                const streams = await getStreams(type, id, config);
+                res.status(200).json({ streams });
+                return;
+            }
+        }
+        
+        // Root fallback
+        res.status(200).send("Cloud Stream Scraper API Active");
+        
+    } catch (error) {
+        console.error("Handler Error:", error);
+        res.status(500).json({ error: "Internal Server Error", details: error.message });
+    }
 }
